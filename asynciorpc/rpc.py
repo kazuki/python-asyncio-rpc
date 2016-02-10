@@ -33,12 +33,21 @@ class RpcBase(asyncio.Protocol, asyncio.DatagramProtocol):
 
 
 class ServerRpc(RpcBase):
-    def __init__(self, handler):
+    def __init__(self, handler, lost_callback=None):
         super(ServerRpc, self).__init__()
         self.handler = handler
+        self.lost_callback = lost_callback
 
     def connection_lost(self, exc):
-        pass
+        if self.lost_callback:
+            self.lost_callback(exc)
+
+    def send_notification(self, name, *args, **kwargs):
+        if self.rpc is None:
+            raise Exception('sever-side notification requires '
+                            'received one or more messages from client')
+        _, msg = self.rpc.request(True, name, *args, **kwargs)
+        self.transport.write(msg)
 
     @asyncio.coroutine
     def handle_message(self, msg):
@@ -46,17 +55,26 @@ class ServerRpc(RpcBase):
             print('ServerRpc::handle_message bug')
             return
         _, req_id, name, args, kwargs = msg
-        ret = self.handler(name, *args, **kwargs)
-        if req_id is not None:
-            response = self.rpc.response(req_id, ret)
-            self.transport.write(response)
+        try:
+            ret = self.handler(name, *args, **kwargs)
+        except Exception as e:
+            if req_id is not None:
+                response = self.rpc.response_error(req_id, str(e))
+                self.transport.write(response)
+        else:
+            if req_id is not None:
+                response = self.rpc.response(req_id, ret)
+                self.transport.write(response)
 
 
 class ClientRpc(RpcBase):
-    def __init__(self, rpc, handler, error_handler, lost_callback):
+    def __init__(self, rpc, handler, notification_handler,
+                 error_handler, lost_callback):
         super(ClientRpc, self).__init__()
         self.rpc = rpc
         self.handler = handler
+        self.notification_handler = notification_handler
+        self.error_handler = error_handler
         self.lost_callback = lost_callback
 
     def connection_lost(self, exc):
@@ -70,7 +88,11 @@ class ClientRpc(RpcBase):
     @asyncio.coroutine
     def handle_message(self, msg):
         if msg[0] == REQUEST_MESSAGE:
-            print('ClientRpc::handle_message bug')
+            if msg[1] is not None:
+                print('ClientRpc::handle_message bug')
+            _, _, name, args, kwargs = msg
+            if self.notification_handler:
+                self.notification_handler(name, *args, **kwargs)
             return
         _, req_id, body = msg
         if msg[0] == RESPONSE_MESSAGE:
@@ -96,20 +118,31 @@ class JsonRpc(object):
             'method': name,
             'params': args if len(args) > 0 else kwargs
         }
-        if len(args) == 0 and len(kwargs):
+        if len(args) == 0 and len(kwargs) == 0:
             del req['params']
         if not notify:
             req['id'] = self._id
             self._id += 1
             if self._id > 0xffffffff:
                 self._id = 0
-        return req['id'], self._encoder.encode(req).encode('utf-8')
+        return req.get('id', None), self._encoder.encode(req).encode('utf-8')
 
     def response(self, req_id, response):
         req = {
             'jsonrpc': '2.0',
             'id': req_id,
             'result': response
+        }
+        return self._encoder.encode(req).encode('utf-8')
+
+    def response_error(self, req_id, message):
+        req = {
+            'jsonrpc': '2.0',
+            'id': req_id,
+            'error': {
+                'code': -32000,
+                'message': message
+            }
         }
         return self._encoder.encode(req).encode('utf-8')
 
@@ -136,19 +169,13 @@ class JsonRpc(object):
                 params = obj.get('params', None)
                 args = params if isinstance(params, list) else []
                 kwargs = params if isinstance(params, dict) else {}
-                messages.append((REQUEST_MESSAGE,
-                                 req_id,
-                                 name,
-                                 args,
-                                 kwargs))
+                messages.append((REQUEST_MESSAGE, req_id, name, args, kwargs))
             elif 'result' in obj:
                 if req_id is None:
                     print('req-id is None')
                     continue
                 result = obj.get('result', None)
-                messages.append((RESPONSE_MESSAGE,
-                                 req_id,
-                                 result))
+                messages.append((RESPONSE_MESSAGE, req_id, result))
             elif 'error' in obj:
                 if req_id is None:
                     print('req-id is None')
@@ -191,6 +218,9 @@ class MsgPackRpc(object):
 
     def response(self, req_id, response):
         return self._packer.pack((1, req_id, None, response))
+
+    def response_error(self, req_id, message):
+        return self._packer.pack((1, req_id, message, None))
 
     def data_received(self, data):
         self._unpacker.feed(data)
